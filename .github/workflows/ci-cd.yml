@@ -1,0 +1,162 @@
+name: CI/CD Pipeline
+
+# Runs on:
+# - any push/PR to main or staging -> install, test, build
+# - push to staging -> also deploy to staging
+# - a published release/tag -> deploy to production
+on:
+  push:
+    branches:
+      - main
+      - staging
+  pull_request:
+    branches:
+      - main
+      - staging
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  install-and-test:
+    name: Install Dependencies & Run Tests
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand(\"ping\").ok' --quiet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-cov
+
+      - name: Run tests
+        run: |
+          pytest test_app.py --junitxml=test-reports/results.xml --cov=. --cov-report=xml -v
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: test-reports/results.xml
+
+  build:
+    name: Build Application
+    needs: install-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Package application
+        run: |
+          mkdir -p dist
+          zip -r dist/flask-app-${{ github.sha }}.zip . \
+            -x "*.git*" "test-reports/*" "dist/*" "venv/*"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flask-app-build
+          path: dist/flask-app-${{ github.sha }}.zip
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    if: github.ref == 'refs/heads/staging' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flask-app-build
+          path: dist
+
+      - name: Deploy to staging server
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          STAGING_USER: ${{ secrets.STAGING_USER }}
+          STAGING_SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+        run: |
+          echo "Deploying $(ls dist) to staging host ${STAGING_HOST}"
+          mkdir -p ~/.ssh
+          echo "${STAGING_SSH_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            dist/flask-app-${{ github.sha }}.zip \
+            "${STAGING_USER}@${STAGING_HOST}:/opt/staging/"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            "${STAGING_USER}@${STAGING_HOST}" \
+            "cd /opt/staging && unzip -o flask-app-${{ github.sha }}.zip -d flask-practice-app && \
+             sudo systemctl restart flask-practice-app-staging"
+
+  deploy-production:
+    name: Deploy to Production
+    needs: build
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: flask-app-build
+          path: dist
+
+      - name: Deploy to production server
+        env:
+          PROD_HOST: ${{ secrets.PROD_HOST }}
+          PROD_USER: ${{ secrets.PROD_USER }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          echo "Deploying release ${{ github.event.release.tag_name }} to production host ${PROD_HOST}"
+          mkdir -p ~/.ssh
+          echo "${PROD_SSH_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            dist/flask-app-${{ github.sha }}.zip \
+            "${PROD_USER}@${PROD_HOST}:/opt/production/"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            "${PROD_USER}@${PROD_HOST}" \
+            "cd /opt/production && unzip -o flask-app-${{ github.sha }}.zip -d flask-practice-app && \
+             sudo systemctl restart flask-practice-app-production"
